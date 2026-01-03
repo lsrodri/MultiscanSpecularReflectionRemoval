@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Multi-Scan Specular Reflection Removal with User Mask
-------------------------------------------------------
-Registers multiple TIFF scans to straightened.tif, then uses a user-provided
-mask (mask.png) to selectively replace highlighted areas with darker pixels
-from other scans while preserving color.
+User-Masked Highlight Removal with Exposure Blending
+-----------------------------------------------------
+Registers multiple TIFF scans to straightened.tif, uses a user-provided mask
+to replace highlighted areas with darker pixels, then automatically adjusts
+exposure to blend with surrounding areas.
 
 Usage: python remove_reflections.py
 
-Place your TIFF images, straightened.tif, and mask.png in INPUT_FOLDER.
+Place your TIFF images, straightened.tif, and mask.png in 'input' folder.
 """
 
 import cv2
 import numpy as np
 from pathlib import Path
 from PIL import Image
+import scipy.ndimage as ndimage
 
 # ==================== CONFIGURATION ====================
-INPUT_FOLDER = "input_scans"  # Folder containing your TIFF images
+INPUT_FOLDER = "input"  # Folder containing your TIFF images
 OUTPUT_FOLDER = "output"
 MAX_FEATURES = 5000  # Number of features to detect for alignment
 GOOD_MATCH_PERCENT = 0.15  # Top % of matches to use
@@ -156,15 +157,69 @@ def register_image(img_to_align, reference_img):
     return img_aligned, h
 
 
-def create_user_masked_composite(images, user_mask, reference_idx=0, feather_size=5):
+def calculate_exposure_adjustment(corrected_region, original_region, mask_border, border_width=20):
+    """
+    Analyze the border between corrected and original regions to determine
+    the exposure adjustment needed for seamless blending.
+    
+    Returns exposure adjustment factor (multiplicative, e.g., 1.08 for +0.08)
+    """
+    h, w = mask_border.shape
+    
+    # Create a dilated version of the mask for border detection
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (border_width, border_width))
+    dilated_mask = cv2.dilate(mask_border, kernel, iterations=1)
+    eroded_mask = cv2.erode(mask_border, kernel, iterations=1)
+    
+    # Border region: dilated - eroded (the transition zone)
+    border_region = (dilated_mask > 0) & (eroded_mask == 0)
+    
+    if np.sum(border_region) < 100:  # Not enough border pixels
+        print(f"  Not enough border pixels to analyze, using no adjustment")
+        return 1.0
+    
+    # Convert images to Lab color space for better brightness analysis
+    corrected_lab = cv2.cvtColor(corrected_region.astype(np.uint8), cv2.COLOR_BGR2LAB)
+    original_lab = cv2.cvtColor(original_region.astype(np.uint8), cv2.COLOR_BGR2LAB)
+    
+    # Extract L (lightness) channel
+    corrected_l = corrected_lab[:, :, 0].astype(np.float32)
+    original_l = original_lab[:, :, 0].astype(np.float32)
+    
+    # Analyze border region
+    border_corrected = corrected_l[border_region]
+    border_original = original_l[border_region]
+    
+    # Calculate mean brightness difference in the border
+    mean_corrected = np.mean(border_corrected)
+    mean_original = np.mean(border_original)
+    
+    # Calculate exposure adjustment
+    if mean_corrected > 0:
+        exposure_adjustment = mean_original / mean_corrected
+    else:
+        exposure_adjustment = 1.0
+    
+    # Clamp adjustment to reasonable range (0.85 to 1.15 roughly = -0.15 to +0.15)
+    exposure_adjustment = np.clip(exposure_adjustment, 0.85, 1.15)
+    
+    print(f"  Border analysis: corrected={mean_corrected:.1f}, original={mean_original:.1f}")
+    print(f"  Calculated exposure adjustment: {exposure_adjustment:.4f} ({(exposure_adjustment-1)*100:+.2f}%)")
+    
+    return exposure_adjustment
+
+
+def create_user_masked_composite_with_exposure_blend(images, user_mask, reference_idx=0, feather_size=5):
     """
     Use user-provided mask to replace highlighted areas with darker pixels
-    from other images while preserving color and detail.
+    from other images, then automatically adjust exposure to seamlessly blend
+    with surrounding areas.
     
     Only processes pixels where mask is white (>128).
     Uses minimum (darkest) values from all images for those pixels.
+    Analyzes border regions to determine exposure adjustment.
     """
-    print(f"\nCreating user-masked composite...")
+    print(f"\nCreating user-masked composite with exposure blending...")
     print(f"  Reference image: {reference_idx}")
     
     reference = images[reference_idx].copy()
@@ -195,9 +250,29 @@ def create_user_masked_composite(images, user_mask, reference_idx=0, feather_siz
     # This removes highlights while preserving color
     min_composite = np.min(stack, axis=0)
     
-    # Blend: use min composite in masked areas, reference everywhere else
+    # Initial blend
     result = (reference.astype(np.float32) * (1 - feathered_mask_float[:, :, np.newaxis]) + 
               min_composite * feathered_mask_float[:, :, np.newaxis])
+    
+    # Calculate exposure adjustment based on border analysis
+    print(f"\n  Analyzing border region for exposure adjustment...")
+    exposure_factor = calculate_exposure_adjustment(
+        result, 
+        reference.astype(np.float32), 
+        binary_mask,
+        border_width=20
+    )
+    
+    # Apply exposure adjustment to corrected regions
+    # Multiply the corrected region by the exposure factor
+    corrected_mask = feathered_mask_float[:, :, np.newaxis]
+    result = reference.astype(np.float32) * (1 - corrected_mask) + \
+             result * (1 - corrected_mask) + \
+             result * corrected_mask * exposure_factor
+    
+    # Simpler approach: adjust only the corrected part
+    result = (reference.astype(np.float32) * (1 - corrected_mask) + 
+              min_composite * corrected_mask * exposure_factor)
     
     result_final = np.clip(result, 0, 255).astype(np.uint8)
     
@@ -229,7 +304,7 @@ def main():
     output_path.mkdir(exist_ok=True)
 
     print("=" * 60)
-    print("USER-MASKED HIGHLIGHT REMOVAL")
+    print("USER-MASKED HIGHLIGHT REMOVAL WITH AUTO EXPOSURE BLENDING")
     print("=" * 60)
 
     # Step 1: Load user mask
@@ -266,32 +341,20 @@ def main():
         save_tiff_rgb(img, output_file)
         print(f"  Saved: {output_file.name}")
 
-    # Step 4: Create user-masked composite
-    print("\nStep 4: Creating user-masked composite...")
+    # Step 4: Create user-masked composite with auto exposure blending
+    print("\nStep 4: Creating user-masked composite with exposure blending...")
     
-    # No feathering for exact mask
-    final_result_nofeather = create_user_masked_composite(
-        registered_images, 
-        user_mask,
-        reference_idx=0,
-        feather_size=0
-    )
-    
-    final_output_nofeather = output_path / "FINAL_masked_no_feather.tif"
-    save_tiff_rgb(final_result_nofeather, final_output_nofeather)
-    print(f"\n✓ Saved final result (no feather): {final_output_nofeather}")
-    
-    # With slight feathering for smoother blend
-    final_result_feather = create_user_masked_composite(
+    # With exposure-aware feathering
+    final_result = create_user_masked_composite_with_exposure_blend(
         registered_images, 
         user_mask,
         reference_idx=0,
         feather_size=5
     )
     
-    final_output_feather = output_path / "FINAL_masked_feathered.tif"
-    save_tiff_rgb(final_result_feather, final_output_feather)
-    print(f"✓ Saved final result (feathered): {final_output_feather}")
+    final_output = output_path / "FINAL_masked_exposure_blended.tif"
+    save_tiff_rgb(final_result, final_output)
+    print(f"\nSaved final result: {final_output}")
     
     # Save the mask used (resized if needed)
     h, w = reference_img.shape[:2]
@@ -304,16 +367,14 @@ def main():
     # Convert grayscale mask to RGB for consistency
     mask_rgb = cv2.cvtColor(user_mask_resized, cv2.COLOR_GRAY2RGB)
     save_tiff_rgb(mask_rgb, mask_output)
-    print(f"✓ Saved mask used: {mask_output}")
+    print(f"Saved mask used: {mask_output}")
 
     print("\n" + "=" * 60)
     print("PROCESSING COMPLETE")
     print("=" * 60)
     print(f"\nOutput files saved to: {output_path.absolute()}")
-    print(f"\n*** FINAL RESULTS: ***")
-    print(f"  1. {final_output_nofeather.name} (exact mask)")
-    print(f"  2. {final_output_feather.name} (smooth blend)")
-    print(f"\nAll TIFF files are saved as RGB and should open in Photoshop!")
+    print(f"\nFinal result: {final_output.name}")
+    print(f"All TIFF files are saved as RGB and should open in Photoshop!")
 
 
 if __name__ == "__main__":
